@@ -2,321 +2,99 @@ import json
 import os
 import time
 import uuid
-import random
-import logging
 import traceback
-import datetime
-import email.utils
-from contextlib import ExitStack
-from typing import Any, Dict, Optional, Tuple, Iterable, Set
+import logging
+import threading
+from pathlib import Path
 
 import azure.functions as func
 import httpx
 from azure.identity import DefaultAzureCredential
 
-# HTTP streaming for Python in Azure Functions requires the FastAPI extension types.
-# See Microsoft docs on "HTTP streams" for Python v2 programming model.
-from azurefunctions.extensions.http.fastapi import Request, JSONResponse, StreamingResponse
-
-
-# ----------------------------
-# Azure Functions app
-# ----------------------------
-
-app = func.FunctionApp()  # Auth level is set per route to match your current style.
-
-
-# ----------------------------
-# Required environment variables
-# ----------------------------
+app = func.FunctionApp()
 
 BASE = os.environ["AZURE_OPENAI_BASE"].rstrip("/")
 DEPLOYMENT = os.environ["AZURE_OPENAI_DEPLOYMENT"]
-
 API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
 V1_API_VERSION = os.getenv("AZURE_OPENAI_V1_API_VERSION", "preview")
-
-DEFAULT_MODEL_ALIAS = os.getenv("AZURE_OPENAI_DEFAULT_MODEL_ALIAS")
 MODEL_MAP = json.loads(os.getenv("AZURE_OPENAI_MODEL_MAP", "{}"))
+DEFAULT_MODEL_ALIAS = os.getenv("AZURE_OPENAI_DEFAULT_MODEL_ALIAS")
 
 SCOPE = "https://cognitiveservices.azure.com/.default"
 
+# Retry and timeout settings
+MAX_RETRIES = int(os.getenv("PROXY_MAX_RETRIES", "2"))
+RETRY_BACKOFF_SECONDS = float(os.getenv("PROXY_RETRY_BACKOFF_SECONDS", "1.5"))
 
-# ----------------------------
-# Helper: env parsing
-# ----------------------------
+CONNECT_TIMEOUT_SECONDS = float(os.getenv("PROXY_CONNECT_TIMEOUT_SECONDS", "20"))
+READ_TIMEOUT_SECONDS = float(os.getenv("PROXY_READ_TIMEOUT_SECONDS", "120"))
+WRITE_TIMEOUT_SECONDS = float(os.getenv("PROXY_WRITE_TIMEOUT_SECONDS", "60"))
+POOL_TIMEOUT_SECONDS = float(os.getenv("PROXY_POOL_TIMEOUT_SECONDS", "20"))
 
-def _getenv_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return default
-    return int(raw)
+# Async fallback settings
+ASYNC_FALLBACK_ENABLED = os.getenv("PROXY_ASYNC_FALLBACK_ENABLED", "true").lower() == "true"
+ASYNC_FALLBACK_POLL_AFTER_SECONDS = int(os.getenv("PROXY_ASYNC_FALLBACK_POLL_AFTER_SECONDS", "30"))
+ASYNC_JOB_TTL_SECONDS = int(os.getenv("PROXY_ASYNC_JOB_TTL_SECONDS", "86400"))
+ASYNC_JOB_DIR = Path(os.getenv("PROXY_ASYNC_JOB_DIR", "/tmp/azure-openai-proxy-jobs"))
+ASYNC_FALLBACK_STATUS_CODES = {429, 500, 502, 503, 504}
+ASYNC_FALLBACK_ERROR_TYPES = {
+    "ConnectTimeout",
+    "ReadTimeout",
+    "WriteTimeout",
+    "PoolTimeout",
+    "ConnectError",
+    "RequestError",
+    "RetryExhausted",
+}
 
-def _getenv_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return default
-    return float(raw)
-
-def _getenv_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return default
-    return raw.strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-# ----------------------------
-# Retry configuration (env-configurable)
-# ----------------------------
-
-RETRYABLE_STATUS_CODES: Set[int] = {408, 409, 425, 429, 500, 502, 503, 504}
-
-MAX_RETRIES = _getenv_int("PROXY_MAX_RETRIES", 6)
-
-RETRY_BASE_DELAY_SECONDS = _getenv_float("PROXY_RETRY_BASE_DELAY_SECONDS", 0.8)
-RETRY_MAX_DELAY_SECONDS = _getenv_float("PROXY_RETRY_MAX_DELAY_SECONDS", 30.0)
-RETRY_JITTER_SECONDS = _getenv_float("PROXY_RETRY_JITTER_SECONDS", 0.5)
-
-RESPECT_RETRY_AFTER = _getenv_bool("PROXY_RESPECT_RETRY_AFTER", True)
-RETRY_AFTER_MAX_SECONDS = _getenv_float("PROXY_RETRY_AFTER_MAX_SECONDS", 30.0)
-
-# Caps for how long we sleep across retries, and how long we allow the overall operation to run.
-# These defaults are chosen to stay under Azure Functions HTTP trigger ~230s boundary.
-RETRY_TOTAL_SLEEP_BUDGET_SECONDS = _getenv_float("PROXY_RETRY_TOTAL_SLEEP_BUDGET_SECONDS", 60.0)
-OPERATION_DEADLINE_SECONDS = _getenv_float("PROXY_OPERATION_DEADLINE_SECONDS", 220.0)
+ASYNC_JOB_DIR.mkdir(parents=True, exist_ok=True)
+_JOB_LOCK = threading.Lock()
 
 
-# ----------------------------
-# Timeout configuration (httpx semantics: connect/read/write/pool)
-# ----------------------------
-
-TIMEOUT_GROWTH_FACTOR = _getenv_float("PROXY_TIMEOUT_GROWTH_FACTOR", 1.6)
-
-CONNECT_TIMEOUT_BASE_SECONDS = _getenv_float("PROXY_CONNECT_TIMEOUT_BASE_SECONDS", 20.0)
-READ_TIMEOUT_BASE_SECONDS = _getenv_float("PROXY_READ_TIMEOUT_BASE_SECONDS", 120.0)
-WRITE_TIMEOUT_BASE_SECONDS = _getenv_float("PROXY_WRITE_TIMEOUT_BASE_SECONDS", 60.0)
-POOL_TIMEOUT_BASE_SECONDS = _getenv_float("PROXY_POOL_TIMEOUT_BASE_SECONDS", 20.0)
-
-# Hard caps to avoid exceeding the HTTP trigger boundary.
-CONNECT_TIMEOUT_MAX_SECONDS = _getenv_float("PROXY_CONNECT_TIMEOUT_MAX_SECONDS", 60.0)
-READ_TIMEOUT_MAX_SECONDS = _getenv_float("PROXY_READ_TIMEOUT_MAX_SECONDS", 225.0)
-WRITE_TIMEOUT_MAX_SECONDS = _getenv_float("PROXY_WRITE_TIMEOUT_MAX_SECONDS", 120.0)
-POOL_TIMEOUT_MAX_SECONDS = _getenv_float("PROXY_POOL_TIMEOUT_MAX_SECONDS", 60.0)
-
-
-# ----------------------------
-# httpx connection pool configuration
-# ----------------------------
-
-HTTPX_MAX_CONNECTIONS = _getenv_int("PROXY_HTTPX_MAX_CONNECTIONS", 200)
-HTTPX_MAX_KEEPALIVE_CONNECTIONS = _getenv_int("PROXY_HTTPX_MAX_KEEPALIVE_CONNECTIONS", 50)
-HTTPX_KEEPALIVE_EXPIRY_SECONDS = _getenv_float("PROXY_HTTPX_KEEPALIVE_EXPIRY_SECONDS", 30.0)
-
-HTTPX_HTTP2 = _getenv_bool("PROXY_HTTPX_HTTP2", False)
-HTTPX_VERIFY_TLS = _getenv_bool("PROXY_HTTPX_VERIFY_TLS", True)
-
-DIAGNOSTIC_HEADERS_ENABLED = _getenv_bool("PROXY_DIAGNOSTIC_HEADERS_ENABLED", True)
-LOG_BACKEND_ERROR_BODY = _getenv_bool("PROXY_LOG_BACKEND_ERROR_BODY", True)
-
-
-# ----------------------------
-# Shared credential + shared httpx client (reuse strongly recommended)
-# ----------------------------
-
-# Reuse credential instance to benefit from token caching and reduce auth requests.
-_AZURE_CREDENTIAL = DefaultAzureCredential()
-
-_HTTP_LIMITS = httpx.Limits(
-    max_connections=HTTPX_MAX_CONNECTIONS,
-    max_keepalive_connections=HTTPX_MAX_KEEPALIVE_CONNECTIONS,
-    keepalive_expiry=HTTPX_KEEPALIVE_EXPIRY_SECONDS,
-)
-
-_HTTP_CLIENT = httpx.Client(
-    limits=_HTTP_LIMITS,
-    http2=HTTPX_HTTP2,
-    verify=HTTPX_VERIFY_TLS,
-    follow_redirects=False,
-)
-
-
-# ----------------------------
-# Small utilities
-# ----------------------------
-
-def _safe_str(value: Any, limit: int = 4000) -> Optional[str]:
-    if value is None:
-        return None
-    s = str(value)
-    if len(s) <= limit:
-        return s
-    return s[:limit] + "...(truncated)"
-
-def _now_utc() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
-
-def _remaining_deadline_seconds(start_monotonic: float) -> float:
-    if OPERATION_DEADLINE_SECONDS <= 0:
-        return float("inf")
-    return max(0.0, OPERATION_DEADLINE_SECONDS - (time.monotonic() - start_monotonic))
-
-def _build_timeout_for_attempt(attempt: int) -> httpx.Timeout:
-    factor = TIMEOUT_GROWTH_FACTOR ** max(0, attempt)
-
-    def grow(base: float, cap: float) -> float:
-        return min(base * factor, cap)
-
+def _build_timeout() -> httpx.Timeout:
     return httpx.Timeout(
-        connect=grow(CONNECT_TIMEOUT_BASE_SECONDS, CONNECT_TIMEOUT_MAX_SECONDS),
-        read=grow(READ_TIMEOUT_BASE_SECONDS, READ_TIMEOUT_MAX_SECONDS),
-        write=grow(WRITE_TIMEOUT_BASE_SECONDS, WRITE_TIMEOUT_MAX_SECONDS),
-        pool=grow(POOL_TIMEOUT_BASE_SECONDS, POOL_TIMEOUT_MAX_SECONDS),
+        connect=CONNECT_TIMEOUT_SECONDS,
+        read=READ_TIMEOUT_SECONDS,
+        write=WRITE_TIMEOUT_SECONDS,
+        pool=POOL_TIMEOUT_SECONDS,
     )
 
-def _should_retry_status(status_code: int) -> bool:
-    return status_code in RETRYABLE_STATUS_CODES
 
-def _should_stream(payload: Dict[str, Any]) -> bool:
-    return bool(payload.get("stream"))
+def _json_response(body: dict, status_code: int, headers: dict | None = None) -> func.HttpResponse:
+    response_headers = headers or {}
+    return func.HttpResponse(
+        json.dumps(body, ensure_ascii=False),
+        status_code=status_code,
+        mimetype="application/json",
+        headers=response_headers,
+    )
 
-def _parse_retry_after_seconds(headers: httpx.Headers) -> Optional[float]:
-    raw = headers.get("retry-after")
-    if not raw:
+
+def _safe_str(value, limit: int = 4000) -> str | None:
+    if value is None:
         return None
-    raw = raw.strip()
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...(truncated)"
 
-    # 1) delta-seconds
-    try:
-        seconds = int(raw)
-        return max(0.0, float(seconds))
-    except Exception:
-        pass
 
-    # 2) HTTP date
-    try:
-        dt = email.utils.parsedate_to_datetime(raw)
-        if dt is None:
-            return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-        return max(0.0, (dt - _now_utc()).total_seconds())
-    except Exception:
-        return None
-
-def _compute_backoff_seconds(attempt: int, retry_after_seconds: Optional[float]) -> float:
-    if retry_after_seconds is not None and RESPECT_RETRY_AFTER:
-        sleep_s = min(float(retry_after_seconds), RETRY_AFTER_MAX_SECONDS)
-        jitter = random.uniform(0.0, RETRY_JITTER_SECONDS) if RETRY_JITTER_SECONDS > 0 else 0.0
-        return sleep_s + jitter
-
-    base = RETRY_BASE_DELAY_SECONDS * (2 ** max(0, attempt))
-    sleep_s = min(base, RETRY_MAX_DELAY_SECONDS)
-    if RETRY_JITTER_SECONDS > 0:
-        sleep_s += random.uniform(0.0, RETRY_JITTER_SECONDS)
-    return sleep_s
-
-def _can_sleep(start_monotonic: float, slept_total: float, sleep_seconds: float) -> bool:
-    if sleep_seconds <= 0:
-        return True
-    if RETRY_TOTAL_SLEEP_BUDGET_SECONDS > 0 and (slept_total + sleep_seconds) > RETRY_TOTAL_SLEEP_BUDGET_SECONDS:
-        return False
-    remaining = _remaining_deadline_seconds(start_monotonic)
-    if remaining <= 0 or sleep_seconds >= remaining:
-        return False
-    return True
-
-def _get_token(request_id: str) -> str:
-    try:
-        return _AZURE_CREDENTIAL.get_token(SCOPE).token
-    except Exception as e:
-        logging.exception("Token acquisition failed request_id=%s", request_id)
-        raise RuntimeError("TokenAcquisitionError") from e
-
-def _proxy_headers(token: str, request_id: str) -> Dict[str, str]:
-    # Keep request headers minimal to avoid custom header limits and reduce variability.
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "x-ms-client-request-id": request_id,
-    }
-
-def _diagnostic_headers(
-    request_id: str,
-    deployment: Optional[str],
-    backend_status: Optional[int],
-    attempt: Optional[int],
-    stream_mode: bool,
-    extra: Optional[Dict[str, str]] = None,
-) -> Dict[str, str]:
-    if not DIAGNOSTIC_HEADERS_ENABLED:
-        return {}
-    h: Dict[str, str] = {
-        "x-proxy-request-id": request_id,
-        "x-proxy-deployment": deployment or "",
-        "x-proxy-backend-status": "" if backend_status is None else str(backend_status),
-        "x-proxy-retry-attempt": "" if attempt is None else str(attempt),
-        "x-proxy-stream": "1" if stream_mode else "0",
-    }
-    if extra:
-        h.update(extra)
-    return h
-
-def _resolve_deployment(payload: Dict[str, Any]) -> Tuple[str, Optional[str]]:
-    requested_model = payload.get("model")
-
-    if not MODEL_MAP:
-        return DEPLOYMENT, requested_model
-
-    if requested_model in MODEL_MAP:
-        return str(MODEL_MAP[requested_model]), requested_model
-
-    if requested_model and requested_model not in MODEL_MAP:
-        raise ValueError(f"Unsupported model '{requested_model}'")
-
-    if DEFAULT_MODEL_ALIAS and DEFAULT_MODEL_ALIAS in MODEL_MAP:
-        return str(MODEL_MAP[DEFAULT_MODEL_ALIAS]), DEFAULT_MODEL_ALIAS
-
-    return DEPLOYMENT, requested_model
-
-def _map_httpx_exception(e: Exception) -> Tuple[str, int]:
-    # Map to proxy-facing error type & HTTP status.
-    if isinstance(e, httpx.ConnectTimeout):
-        return "ConnectTimeout", 504
-    if isinstance(e, httpx.ReadTimeout):
-        return "ReadTimeout", 504
-    if isinstance(e, httpx.WriteTimeout):
-        return "WriteTimeout", 504
-    if isinstance(e, httpx.PoolTimeout):
-        return "PoolTimeout", 503
-    if isinstance(e, httpx.TimeoutException):
-        return "TimeoutException", 504
-    if isinstance(e, httpx.ConnectError):
-        return "ConnectError", 502
-    if isinstance(e, httpx.NetworkError):
-        return "NetworkError", 502
-    if isinstance(e, httpx.ProtocolError):
-        return "ProtocolError", 502
-    if isinstance(e, httpx.ProxyError):
-        return "ProxyError", 502
-    if isinstance(e, httpx.RequestError):
-        return "RequestError", 502
-    return "UnexpectedProxyError", 500
-
-def _error_json(
+def _build_error_body(
+    *,
     request_id: str,
     error_type: str,
     message: str,
     stage: str,
-    status_code: int,
-    requested_model: Optional[str],
-    deployment: Optional[str],
-    backend_url: Optional[str],
-    backend_status_code: Optional[int] = None,
-    backend_response_text: Optional[str] = None,
-    retry_attempt: Optional[int] = None,
-    exception: Optional[Exception] = None,
-) -> JSONResponse:
-    body: Dict[str, Any] = {
+    requested_model: str | None = None,
+    deployment: str | None = None,
+    backend_url: str | None = None,
+    backend_status_code: int | None = None,
+    backend_response_text: str | None = None,
+    retry_attempt: int | None = None,
+    max_retries: int | None = None,
+    exception: Exception | None = None,
+) -> dict:
+    body = {
         "ok": False,
         "proxy_request_id": request_id,
         "error_type": error_type,
@@ -328,269 +106,412 @@ def _error_json(
         "backend_status_code": backend_status_code,
         "backend_response_text": _safe_str(backend_response_text),
         "retry_attempt": retry_attempt,
-        "max_retries": MAX_RETRIES,
+        "max_retries": max_retries,
     }
+
     if exception is not None:
         body["exception_class"] = exception.__class__.__name__
         body["exception_message"] = _safe_str(exception)
         body["traceback"] = traceback.format_exc()
 
-    logging.error("Proxy error request_id=%s body=%s", request_id, json.dumps(body, ensure_ascii=False))
-    return JSONResponse(
-        content=body,
-        status_code=status_code,
-        headers=_diagnostic_headers(
-            request_id=request_id,
-            deployment=deployment,
-            backend_status=backend_status_code,
-            attempt=retry_attempt,
-            stream_mode=False,
-        ),
-    )
+    return body
 
 
-# ----------------------------
-# Non-stream forwarding (JSON)
-# ----------------------------
-
-def _forward_non_stream(
+def _error_response(
+    *,
     request_id: str,
-    payload: Dict[str, Any],
-    backend_url: str,
-    params: Dict[str, str],
-    requested_model: Optional[str],
-    deployment: Optional[str],
-) -> JSONResponse:
-    start = time.monotonic()
-    slept_total = 0.0
-
-    try:
-        token = _get_token(request_id)
-    except Exception as e:
-        return _error_json(
-            request_id=request_id,
-            error_type="TokenAcquisitionError",
-            message="Failed to acquire Azure credential token.",
-            stage="credential",
-            status_code=500,
-            requested_model=requested_model,
-            deployment=deployment,
-            backend_url=backend_url,
-            exception=e,
-        )
-
-    headers = _proxy_headers(token, request_id)
-    last_backend_text: Optional[str] = None
-    last_status: Optional[int] = None
-    last_exception: Optional[Exception] = None
-
-    for attempt in range(MAX_RETRIES + 1):
-        timeout = _build_timeout_for_attempt(attempt)
-
-        try:
-            r = _HTTP_CLIENT.post(
-                backend_url,
-                params=params,
-                headers=headers,
-                json=payload,
-                timeout=timeout,
-            )
-            last_status = r.status_code
-
-            if _should_retry_status(r.status_code) and attempt < MAX_RETRIES:
-                if LOG_BACKEND_ERROR_BODY:
-                    try:
-                        last_backend_text = r.text
-                    except Exception:
-                        last_backend_text = None
-
-                retry_after = _parse_retry_after_seconds(r.headers)
-                sleep_seconds = _compute_backoff_seconds(attempt, retry_after)
-
-                logging.warning(
-                    "Retryable status=%s attempt=%s sleep=%.3fs request_id=%s",
-                    r.status_code, attempt, sleep_seconds, request_id
-                )
-
-                if not _can_sleep(start, slept_total, sleep_seconds):
-                    break
-
-                time.sleep(sleep_seconds)
-                slept_total += sleep_seconds
-                continue
-
-            # Return response as JSON (Azure OpenAI responses are JSON).
-            try:
-                body_obj = r.json()
-            except Exception:
-                body_obj = {"raw": _safe_str(r.text)}
-
-            return JSONResponse(
-                content=body_obj,
-                status_code=r.status_code,
-                headers=_diagnostic_headers(
-                    request_id=request_id,
-                    deployment=deployment,
-                    backend_status=r.status_code,
-                    attempt=attempt,
-                    stream_mode=False,
-                ),
-            )
-
-        except Exception as e:
-            last_exception = e
-            error_type, mapped_status = _map_httpx_exception(e)
-
-            if attempt < MAX_RETRIES:
-                sleep_seconds = _compute_backoff_seconds(attempt, None)
-                logging.warning(
-                    "Retryable exception=%s attempt=%s sleep=%.3fs request_id=%s",
-                    error_type, attempt, sleep_seconds, request_id
-                )
-
-                if not _can_sleep(start, slept_total, sleep_seconds):
-                    break
-
-                time.sleep(sleep_seconds)
-                slept_total += sleep_seconds
-                continue
-
-            return _error_json(
-                request_id=request_id,
-                error_type=error_type,
-                message="Proxy call failed (non-stream).",
-                stage="proxy_to_backend",
-                status_code=mapped_status,
-                requested_model=requested_model,
-                deployment=deployment,
-                backend_url=backend_url,
-                backend_status_code=last_status,
-                backend_response_text=last_backend_text,
-                retry_attempt=attempt,
-                exception=e,
-            )
-
-    # Stopped due to budgets/deadline (avoid hitting ~230s boundary)
-    return _error_json(
+    error_type: str,
+    message: str,
+    status_code: int,
+    stage: str,
+    requested_model: str | None = None,
+    deployment: str | None = None,
+    backend_url: str | None = None,
+    backend_status_code: int | None = None,
+    backend_response_text: str | None = None,
+    retry_attempt: int | None = None,
+    max_retries: int | None = None,
+    exception: Exception | None = None,
+) -> func.HttpResponse:
+    body = _build_error_body(
         request_id=request_id,
-        error_type="RetryBudgetExhausted",
-        message="Stopped retrying due to retry sleep budget or operation deadline.",
-        stage="proxy_to_backend",
-        status_code=502,
+        error_type=error_type,
+        message=message,
+        stage=stage,
         requested_model=requested_model,
         deployment=deployment,
         backend_url=backend_url,
-        backend_status_code=last_status,
-        backend_response_text=last_backend_text,
-        retry_attempt=MAX_RETRIES,
-        exception=last_exception,
+        backend_status_code=backend_status_code,
+        backend_response_text=backend_response_text,
+        retry_attempt=retry_attempt,
+        max_retries=max_retries,
+        exception=exception,
+    )
+    logging.exception("Proxy error body: %s", json.dumps(body, ensure_ascii=False))
+    return _json_response(body, status_code=status_code)
+
+
+def _resolve_deployment(payload: dict) -> tuple[str, str | None]:
+    """
+    Resolve incoming OpenAI `model` alias to an Azure deployment name.
+    Backward compatibility:
+    - If no model map is configured, use AZURE_OPENAI_DEPLOYMENT.
+    - If model is omitted, use the default deployment.
+    """
+    requested_model = payload.get("model")
+
+    if not MODEL_MAP:
+        return DEPLOYMENT, requested_model
+
+    if requested_model in MODEL_MAP:
+        return MODEL_MAP[requested_model], requested_model
+
+    if requested_model and requested_model not in MODEL_MAP:
+        raise ValueError(f"Unsupported model '{requested_model}'")
+
+    if DEFAULT_MODEL_ALIAS and DEFAULT_MODEL_ALIAS in MODEL_MAP:
+        return MODEL_MAP[DEFAULT_MODEL_ALIAS], DEFAULT_MODEL_ALIAS
+
+    return DEPLOYMENT, requested_model
+
+
+def _should_retry_response(response: httpx.Response) -> bool:
+    return response.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _should_stream(payload: dict) -> bool:
+    return bool(payload.get("stream"))
+
+
+def _get_token(request_id: str) -> str:
+    try:
+        return DefaultAzureCredential().get_token(SCOPE).token
+    except Exception as e:
+        logging.exception("Token acquisition failed for request_id=%s", request_id)
+        raise RuntimeError("TokenAcquisitionError") from e
+
+
+def _proxy_headers(token: str, request_id: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "x-proxy-request-id": request_id,
+    }
+
+
+def _job_file(job_id: str) -> Path:
+    return ASYNC_JOB_DIR / f"{job_id}.json"
+
+
+def _cleanup_expired_jobs() -> None:
+    now = time.time()
+    for path in ASYNC_JOB_DIR.glob("*.json"):
+        try:
+            if now - path.stat().st_mtime > ASYNC_JOB_TTL_SECONDS:
+                path.unlink(missing_ok=True)
+        except Exception:
+            logging.exception("Failed to cleanup async job file: %s", path)
+
+
+def _save_job(job: dict) -> None:
+    with _JOB_LOCK:
+        _cleanup_expired_jobs()
+        _job_file(job["job_id"]).write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_job(job_id: str) -> dict | None:
+    path = _job_file(job_id)
+    if not path.exists():
+        return None
+    with _JOB_LOCK:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _build_job_status_url(job_id: str) -> str:
+    return f"/api/v1/jobs/{job_id}"
+
+
+def _parse_json_bytes(raw: bytes | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _response_text(response: func.HttpResponse) -> str:
+    try:
+        return response.get_body().decode("utf-8")
+    except Exception:
+        return response.get_body().decode("utf-8", errors="replace")
+
+
+def _is_async_fallback_candidate(response: func.HttpResponse, payload: dict) -> bool:
+    if not ASYNC_FALLBACK_ENABLED:
+        return False
+
+    if _should_stream(payload):
+        return False
+
+    if response.status_code not in ASYNC_FALLBACK_STATUS_CODES:
+        return False
+
+    parsed = _parse_json_bytes(response.get_body())
+    if parsed is None:
+        return response.status_code in {502, 503, 504}
+
+    error_type = parsed.get("error_type")
+    backend_status_code = parsed.get("backend_status_code")
+
+    if error_type in ASYNC_FALLBACK_ERROR_TYPES:
+        return True
+
+    if isinstance(backend_status_code, int) and backend_status_code in ASYNC_FALLBACK_STATUS_CODES:
+        return True
+
+    return response.status_code in {502, 503, 504}
+
+
+def _accepted_async_response(*, request_id: str, job_id: str, deployment: str | None, requested_model: str | None) -> func.HttpResponse:
+    body = {
+        "ok": True,
+        "mode": "async_fallback",
+        "proxy_request_id": request_id,
+        "job_id": job_id,
+        "status": "queued",
+        "status_url": _build_job_status_url(job_id),
+        "poll_after_seconds": ASYNC_FALLBACK_POLL_AFTER_SECONDS,
+        "deployment": deployment,
+        "requested_model": requested_model,
+    }
+    return _json_response(
+        body,
+        status_code=202,
+        headers={
+            "x-proxy-request-id": request_id,
+            "x-proxy-mode": "async_fallback",
+            "x-proxy-job-id": job_id,
+            "Retry-After": str(ASYNC_FALLBACK_POLL_AFTER_SECONDS),
+        },
     )
 
 
-# ----------------------------
-# Stream forwarding (true chunked proxy)
-# ----------------------------
+def _run_async_job(job_id: str) -> None:
+    job = _load_job(job_id)
+    if job is None:
+        return
 
-def _prepare_backend_stream_with_retries(
+    job["status"] = "running"
+    job["started_at"] = time.time()
+    _save_job(job)
+
+    request_data = job["request"]
+    response = _forward_request(
+        request_id=f"{job_id}:async",
+        payload=request_data["payload"],
+        backend_url=request_data["backend_url"],
+        params=request_data["params"],
+        requested_model=request_data["requested_model"],
+        deployment=request_data["deployment"],
+    )
+
+    response_text = _response_text(response)
+    content_type = response.mimetype or "application/json"
+
+    if 200 <= response.status_code < 300:
+        job["status"] = "succeeded"
+    else:
+        job["status"] = "failed"
+
+    job["finished_at"] = time.time()
+    job["result"] = {
+        "status_code": response.status_code,
+        "content_type": content_type,
+        "body_text": response_text,
+        "headers": {
+            "x-proxy-backend-status": response.headers.get("x-proxy-backend-status", ""),
+            "x-proxy-deployment": response.headers.get("x-proxy-deployment", ""),
+            "x-proxy-retry-attempt": response.headers.get("x-proxy-retry-attempt", ""),
+        },
+    }
+    _save_job(job)
+
+
+def _submit_async_job(
+    *,
     request_id: str,
-    payload: Dict[str, Any],
+    payload: dict,
     backend_url: str,
-    params: Dict[str, str],
-    headers: Dict[str, str],
-) -> Tuple[httpx.Response, ExitStack, int]:
-    """
-    Open the backend stream with retries BEFORE sending any bytes to the client.
-    This ensures we can retry safely without corrupting client stream.
-    """
-    start = time.monotonic()
-    slept_total = 0.0
-    last_exception: Optional[Exception] = None
+    params: dict,
+    requested_model: str | None,
+    deployment: str | None,
+) -> func.HttpResponse:
+    job_id = str(uuid.uuid4())
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "created_at": time.time(),
+        "request": {
+            "payload": payload,
+            "backend_url": backend_url,
+            "params": params,
+            "requested_model": requested_model,
+            "deployment": deployment,
+        },
+        "result": None,
+    }
+    _save_job(job)
 
-    for attempt in range(MAX_RETRIES + 1):
-        timeout = _build_timeout_for_attempt(attempt)
-        stack = ExitStack()
+    worker = threading.Thread(target=_run_async_job, args=(job_id,), daemon=True)
+    worker.start()
 
-        try:
-            r = stack.enter_context(
-                _HTTP_CLIENT.stream(
-                    "POST",
-                    backend_url,
-                    params=params,
-                    headers=headers,
-                    json=payload,
-                    timeout=timeout,
-                )
+    return _accepted_async_response(
+        request_id=request_id,
+        job_id=job_id,
+        deployment=deployment,
+        requested_model=requested_model,
+    )
+
+
+def _stream_backend_response(
+    *,
+    request_id: str,
+    payload: dict,
+    backend_url: str,
+    params: dict,
+    headers: dict,
+    requested_model: str | None,
+    deployment: str | None,
+) -> func.HttpResponse:
+    try:
+        with httpx.stream(
+            "POST",
+            backend_url,
+            params=params,
+            headers=headers,
+            json=payload,
+            timeout=_build_timeout(),
+        ) as r:
+            content_type = r.headers.get("content-type", "text/event-stream")
+            chunks = []
+            for chunk in r.iter_raw():
+                chunks.append(chunk)
+
+            return func.HttpResponse(
+                body=b"".join(chunks),
+                status_code=r.status_code,
+                mimetype=content_type,
+                headers={
+                    "x-proxy-request-id": request_id,
+                    "x-proxy-backend-status": str(r.status_code),
+                    "x-proxy-deployment": deployment or "",
+                },
             )
+    except httpx.ConnectTimeout as e:
+        return _error_response(
+            request_id=request_id,
+            error_type="ConnectTimeout",
+            message="Timed out while connecting to Azure backend.",
+            status_code=504,
+            stage="proxy_to_backend_stream",
+            requested_model=requested_model,
+            deployment=deployment,
+            backend_url=backend_url,
+            exception=e,
+        )
+    except httpx.ReadTimeout as e:
+        return _error_response(
+            request_id=request_id,
+            error_type="ReadTimeout",
+            message="Timed out while reading streaming response from Azure backend.",
+            status_code=504,
+            stage="proxy_to_backend_stream",
+            requested_model=requested_model,
+            deployment=deployment,
+            backend_url=backend_url,
+            exception=e,
+        )
+    except httpx.WriteTimeout as e:
+        return _error_response(
+            request_id=request_id,
+            error_type="WriteTimeout",
+            message="Timed out while sending streaming request to Azure backend.",
+            status_code=504,
+            stage="proxy_to_backend_stream",
+            requested_model=requested_model,
+            deployment=deployment,
+            backend_url=backend_url,
+            exception=e,
+        )
+    except httpx.PoolTimeout as e:
+        return _error_response(
+            request_id=request_id,
+            error_type="PoolTimeout",
+            message="Timed out while waiting for a pooled HTTP connection.",
+            status_code=503,
+            stage="proxy_to_backend_stream",
+            requested_model=requested_model,
+            deployment=deployment,
+            backend_url=backend_url,
+            exception=e,
+        )
+    except httpx.ConnectError as e:
+        return _error_response(
+            request_id=request_id,
+            error_type="ConnectError",
+            message="Failed to connect to Azure backend.",
+            status_code=502,
+            stage="proxy_to_backend_stream",
+            requested_model=requested_model,
+            deployment=deployment,
+            backend_url=backend_url,
+            exception=e,
+        )
+    except httpx.RequestError as e:
+        return _error_response(
+            request_id=request_id,
+            error_type="RequestError",
+            message="HTTPX request error while streaming from Azure backend.",
+            status_code=502,
+            stage="proxy_to_backend_stream",
+            requested_model=requested_model,
+            deployment=deployment,
+            backend_url=backend_url,
+            exception=e,
+        )
+    except Exception as e:
+        return _error_response(
+            request_id=request_id,
+            error_type="UnexpectedProxyError",
+            message="Unexpected proxy error while streaming from Azure backend.",
+            status_code=500,
+            stage="proxy_to_backend_stream",
+            requested_model=requested_model,
+            deployment=deployment,
+            backend_url=backend_url,
+            exception=e,
+        )
 
-            if _should_retry_status(r.status_code) and attempt < MAX_RETRIES:
-                # Drain and close before retrying.
-                try:
-                    if LOG_BACKEND_ERROR_BODY:
-                        _ = r.text  # best-effort read for logging/debug
-                except Exception:
-                    pass
-                try:
-                    r.read()
-                except Exception:
-                    pass
-                stack.close()
 
-                retry_after = _parse_retry_after_seconds(r.headers)
-                sleep_seconds = _compute_backoff_seconds(attempt, retry_after)
-
-                logging.warning(
-                    "Retryable stream status=%s attempt=%s sleep=%.3fs request_id=%s",
-                    r.status_code, attempt, sleep_seconds, request_id
-                )
-
-                if not _can_sleep(start, slept_total, sleep_seconds):
-                    break
-
-                time.sleep(sleep_seconds)
-                slept_total += sleep_seconds
-                continue
-
-            return r, stack, attempt
-
-        except Exception as e:
-            last_exception = e
-            stack.close()
-
-            if attempt < MAX_RETRIES:
-                sleep_seconds = _compute_backoff_seconds(attempt, None)
-                logging.warning(
-                    "Retryable stream exception=%s attempt=%s sleep=%.3fs request_id=%s",
-                    e.__class__.__name__, attempt, sleep_seconds, request_id
-                )
-
-                if not _can_sleep(start, slept_total, sleep_seconds):
-                    break
-
-                time.sleep(sleep_seconds)
-                slept_total += sleep_seconds
-                continue
-
-            raise
-
-    raise RuntimeError("RetryBudgetExhausted") from last_exception
-
-def _forward_stream(
+def _forward_request(
+    *,
     request_id: str,
-    payload: Dict[str, Any],
+    payload: dict,
     backend_url: str,
-    params: Dict[str, str],
-    requested_model: Optional[str],
-    deployment: Optional[str],
-) -> Any:
+    params: dict,
+    requested_model: str | None,
+    deployment: str | None,
+) -> func.HttpResponse:
     try:
         token = _get_token(request_id)
     except Exception as e:
-        return _error_json(
+        return _error_response(
             request_id=request_id,
             error_type="TokenAcquisitionError",
             message="Failed to acquire Azure credential token.",
-            stage="credential",
             status_code=500,
+            stage="credential",
             requested_model=requested_model,
             deployment=deployment,
             backend_url=backend_url,
@@ -599,96 +520,200 @@ def _forward_stream(
 
     headers = _proxy_headers(token, request_id)
 
-    try:
-        r, stack, attempt = _prepare_backend_stream_with_retries(
+    if _should_stream(payload):
+        return _stream_backend_response(
             request_id=request_id,
             payload=payload,
             backend_url=backend_url,
             params=params,
             headers=headers,
-        )
-    except Exception as e:
-        error_type, status_code = _map_httpx_exception(e)
-        if isinstance(e, RuntimeError) and str(e) == "RetryBudgetExhausted":
-            error_type, status_code = "RetryBudgetExhausted", 502
-
-        return _error_json(
-            request_id=request_id,
-            error_type=error_type,
-            message="Proxy failed (stream) before sending any bytes.",
-            stage="proxy_to_backend_stream",
-            status_code=status_code,
             requested_model=requested_model,
             deployment=deployment,
-            backend_url=backend_url,
-            retry_attempt=MAX_RETRIES,
-            exception=e,
         )
 
-    content_type = r.headers.get("content-type", "text/event-stream")
+    last_exception = None
 
-    # Pass through a small set of useful hop-by-hop safe headers (optional, conservative).
-    passthrough_headers: Dict[str, str] = {}
-    for key in ("cache-control", "pragma", "content-encoding"):
-        v = r.headers.get(key)
-        if v:
-            passthrough_headers[key] = v
-
-    diag_headers = _diagnostic_headers(
-        request_id=request_id,
-        deployment=deployment,
-        backend_status=r.status_code,
-        attempt=attempt,
-        stream_mode=True,
-        extra=passthrough_headers,
-    )
-
-    def iterator() -> Iterable[bytes]:
-        """
-        Stream raw chunks edge-to-edge.
-        IMPORTANT: After yielding begins, do NOT retry, or you'll corrupt the client stream.
-        """
+    for attempt in range(MAX_RETRIES + 1):
         try:
-            for chunk in r.iter_raw():
-                yield chunk
-        except Exception:
-            logging.exception("Streaming forward error request_id=%s", request_id)
-        finally:
-            try:
-                stack.close()
-            except Exception:
-                pass
+            with httpx.Client(timeout=_build_timeout()) as client:
+                r = client.post(
+                    backend_url,
+                    params=params,
+                    headers=headers,
+                    json=payload,
+                )
 
-    return StreamingResponse(
-        iterator(),
-        media_type=content_type,
-        status_code=r.status_code,
-        headers=diag_headers,
+            if _should_retry_response(r) and attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                continue
+
+            return func.HttpResponse(
+                r.content,
+                status_code=r.status_code,
+                mimetype=r.headers.get("content-type", "application/json"),
+                headers={
+                    "x-proxy-request-id": request_id,
+                    "x-proxy-backend-status": str(r.status_code),
+                    "x-proxy-deployment": deployment or "",
+                    "x-proxy-retry-attempt": str(attempt),
+                },
+            )
+
+        except httpx.ConnectTimeout as e:
+            last_exception = e
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                continue
+            return _error_response(
+                request_id=request_id,
+                error_type="ConnectTimeout",
+                message="Timed out while connecting to Azure backend.",
+                status_code=504,
+                stage="proxy_to_backend",
+                requested_model=requested_model,
+                deployment=deployment,
+                backend_url=backend_url,
+                retry_attempt=attempt,
+                max_retries=MAX_RETRIES,
+                exception=e,
+            )
+
+        except httpx.ReadTimeout as e:
+            last_exception = e
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                continue
+            return _error_response(
+                request_id=request_id,
+                error_type="ReadTimeout",
+                message="Timed out while waiting for response data from Azure backend.",
+                status_code=504,
+                stage="proxy_to_backend",
+                requested_model=requested_model,
+                deployment=deployment,
+                backend_url=backend_url,
+                retry_attempt=attempt,
+                max_retries=MAX_RETRIES,
+                exception=e,
+            )
+
+        except httpx.WriteTimeout as e:
+            last_exception = e
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                continue
+            return _error_response(
+                request_id=request_id,
+                error_type="WriteTimeout",
+                message="Timed out while sending request data to Azure backend.",
+                status_code=504,
+                stage="proxy_to_backend",
+                requested_model=requested_model,
+                deployment=deployment,
+                backend_url=backend_url,
+                retry_attempt=attempt,
+                max_retries=MAX_RETRIES,
+                exception=e,
+            )
+
+        except httpx.PoolTimeout as e:
+            last_exception = e
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                continue
+            return _error_response(
+                request_id=request_id,
+                error_type="PoolTimeout",
+                message="Timed out while waiting for a pooled HTTP connection.",
+                status_code=503,
+                stage="proxy_to_backend",
+                requested_model=requested_model,
+                deployment=deployment,
+                backend_url=backend_url,
+                retry_attempt=attempt,
+                max_retries=MAX_RETRIES,
+                exception=e,
+            )
+
+        except httpx.ConnectError as e:
+            last_exception = e
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                continue
+            return _error_response(
+                request_id=request_id,
+                error_type="ConnectError",
+                message="Failed to connect to Azure backend.",
+                status_code=502,
+                stage="proxy_to_backend",
+                requested_model=requested_model,
+                deployment=deployment,
+                backend_url=backend_url,
+                retry_attempt=attempt,
+                max_retries=MAX_RETRIES,
+                exception=e,
+            )
+
+        except httpx.RequestError as e:
+            last_exception = e
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                continue
+            return _error_response(
+                request_id=request_id,
+                error_type="RequestError",
+                message="HTTPX request error while calling Azure backend.",
+                status_code=502,
+                stage="proxy_to_backend",
+                requested_model=requested_model,
+                deployment=deployment,
+                backend_url=backend_url,
+                retry_attempt=attempt,
+                max_retries=MAX_RETRIES,
+                exception=e,
+            )
+
+        except Exception as e:
+            last_exception = e
+            return _error_response(
+                request_id=request_id,
+                error_type="UnexpectedProxyError",
+                message="Unexpected proxy-side error while calling Azure backend.",
+                status_code=500,
+                stage="proxy_to_backend",
+                requested_model=requested_model,
+                deployment=deployment,
+                backend_url=backend_url,
+                retry_attempt=attempt,
+                max_retries=MAX_RETRIES,
+                exception=e,
+            )
+
+    return _error_response(
+        request_id=request_id,
+        error_type="RetryExhausted",
+        message="All retry attempts were exhausted.",
+        status_code=502,
+        stage="proxy_to_backend",
+        requested_model=requested_model,
+        deployment=deployment,
+        backend_url=backend_url,
+        retry_attempt=MAX_RETRIES,
+        max_retries=MAX_RETRIES,
+        exception=last_exception,
     )
 
 
-# ----------------------------
-# Unified forward entry
-# ----------------------------
-
-def _forward_request(
+def _handle_proxy_request(
+    *,
     request_id: str,
-    payload: Dict[str, Any],
+    payload: dict,
     backend_url: str,
-    params: Dict[str, str],
-    requested_model: Optional[str],
-    deployment: Optional[str],
-) -> Any:
-    if _should_stream(payload):
-        return _forward_stream(
-            request_id=request_id,
-            payload=payload,
-            backend_url=backend_url,
-            params=params,
-            requested_model=requested_model,
-            deployment=deployment,
-        )
-    return _forward_non_stream(
+    params: dict,
+    requested_model: str | None,
+    deployment: str | None,
+) -> func.HttpResponse:
+    response = _forward_request(
         request_id=request_id,
         payload=payload,
         backend_url=backend_url,
@@ -697,45 +722,50 @@ def _forward_request(
         deployment=deployment,
     )
 
+    if _is_async_fallback_candidate(response, payload):
+        logging.warning(
+            "Sync request failed and will fallback to async. request_id=%s status=%s deployment=%s",
+            request_id,
+            response.status_code,
+            deployment,
+        )
+        return _submit_async_job(
+            request_id=request_id,
+            payload=payload,
+            backend_url=backend_url,
+            params=params,
+            requested_model=requested_model,
+            deployment=deployment,
+        )
 
-# ----------------------------
-# Routes
-# ----------------------------
+    return response
 
-@app.route(route="v1/chat/completions", methods=[func.HttpMethod.POST], auth_level=func.AuthLevel.FUNCTION)
-async def chat_completions(req: Request) -> Any:
+
+@app.route(route="v1/chat/completions", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def chat_completions(req: func.HttpRequest) -> func.HttpResponse:
     request_id = str(uuid.uuid4())
-    start = time.monotonic()
 
     try:
-        payload = await req.json()
-        if not isinstance(payload, dict):
-            raise ValueError("Request JSON body must be an object.")
-    except Exception as e:
-        return _error_json(
+        payload = req.get_json()
+    except ValueError as e:
+        return _error_response(
             request_id=request_id,
             error_type="InvalidJSON",
-            message="Request body is not valid JSON object.",
-            stage="request_parse",
+            message="Request body is not valid JSON.",
             status_code=400,
-            requested_model=None,
-            deployment=None,
-            backend_url=None,
+            stage="request_parse",
             exception=e,
         )
 
     try:
         deployment, requested_model = _resolve_deployment(payload)
-    except Exception as e:
-        return _error_json(
+    except ValueError as e:
+        return _error_response(
             request_id=request_id,
             error_type="ModelResolutionError",
             message=str(e),
-            stage="model_resolution",
             status_code=400,
-            requested_model=payload.get("model"),
-            deployment=None,
-            backend_url=None,
+            stage="model_resolution",
             exception=e,
         )
 
@@ -745,7 +775,7 @@ async def chat_completions(req: Request) -> Any:
     backend_url = f"{BASE}/openai/deployments/{deployment}/chat/completions"
     params = {"api-version": API_VERSION}
 
-    resp = _forward_request(
+    return _handle_proxy_request(
         request_id=request_id,
         payload=payload,
         backend_url=backend_url,
@@ -754,56 +784,41 @@ async def chat_completions(req: Request) -> Any:
         deployment=deployment,
     )
 
-    logging.info(
-        "chat_completions done request_id=%s stream=%s duration=%.3fs",
-        request_id, "1" if _should_stream(payload) else "0", time.monotonic() - start
-    )
-    return resp
 
-@app.route(route="v1/responses", methods=[func.HttpMethod.POST], auth_level=func.AuthLevel.FUNCTION)
-async def responses(req: Request) -> Any:
+@app.route(route="v1/responses", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def responses(req: func.HttpRequest) -> func.HttpResponse:
     request_id = str(uuid.uuid4())
-    start = time.monotonic()
 
     try:
-        payload = await req.json()
-        if not isinstance(payload, dict):
-            raise ValueError("Request JSON body must be an object.")
-    except Exception as e:
-        return _error_json(
+        payload = req.get_json()
+    except ValueError as e:
+        return _error_response(
             request_id=request_id,
             error_type="InvalidJSON",
-            message="Request body is not valid JSON object.",
-            stage="request_parse",
+            message="Request body is not valid JSON.",
             status_code=400,
-            requested_model=None,
-            deployment=None,
-            backend_url=None,
+            stage="request_parse",
             exception=e,
         )
 
     try:
         deployment, requested_model = _resolve_deployment(payload)
-    except Exception as e:
-        return _error_json(
+    except ValueError as e:
+        return _error_response(
             request_id=request_id,
             error_type="ModelResolutionError",
             message=str(e),
-            stage="model_resolution",
             status_code=400,
-            requested_model=payload.get("model"),
-            deployment=None,
-            backend_url=None,
+            stage="model_resolution",
             exception=e,
         )
 
-    # v1 Responses API expects deployed model name (deployment) as "model"
     payload["model"] = deployment
 
     backend_url = f"{BASE}/openai/v1/responses"
     params = {"api-version": V1_API_VERSION}
 
-    resp = _forward_request(
+    return _handle_proxy_request(
         request_id=request_id,
         payload=payload,
         backend_url=backend_url,
@@ -812,8 +827,66 @@ async def responses(req: Request) -> Any:
         deployment=deployment,
     )
 
-    logging.info(
-        "responses done request_id=%s stream=%s duration=%.3fs",
-        request_id, "1" if _should_stream(payload) else "0", time.monotonic() - start
-    )
-    return resp
+
+@app.route(route="v1/jobs/{job_id}", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def get_job(req: func.HttpRequest) -> func.HttpResponse:
+    request_id = str(uuid.uuid4())
+    job_id = req.route_params.get("job_id")
+
+    if not job_id:
+        return _error_response(
+            request_id=request_id,
+            error_type="MissingJobId",
+            message="job_id is required.",
+            status_code=400,
+            stage="job_lookup",
+        )
+
+    job = _load_job(job_id)
+    if job is None:
+        return _error_response(
+            request_id=request_id,
+            error_type="JobNotFound",
+            message=f"Async job '{job_id}' was not found.",
+            status_code=404,
+            stage="job_lookup",
+        )
+
+    body = {
+        "ok": True,
+        "job_id": job_id,
+        "status": job["status"],
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "status_url": _build_job_status_url(job_id),
+        "poll_after_seconds": ASYNC_FALLBACK_POLL_AFTER_SECONDS,
+    }
+
+    if job["status"] in {"queued", "running"}:
+        return _json_response(
+            body,
+            status_code=200,
+            headers={
+                "x-proxy-request-id": request_id,
+                "Retry-After": str(ASYNC_FALLBACK_POLL_AFTER_SECONDS),
+            },
+        )
+
+    result = job.get("result") or {}
+    result_body_text = result.get("body_text")
+    result_body_json = None
+    if isinstance(result_body_text, str):
+        try:
+            result_body_json = json.loads(result_body_text)
+        except Exception:
+            result_body_json = None
+
+    body["result"] = {
+        "status_code": result.get("status_code"),
+        "content_type": result.get("content_type"),
+        "headers": result.get("headers", {}),
+        "body_json": result_body_json,
+        "body_text": None if result_body_json is not None else result_body_text,
+    }
+    return _json_response(body, status_code=200, headers={"x-proxy-request-id": request_id})
