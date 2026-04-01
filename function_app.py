@@ -4,6 +4,8 @@ import time
 import uuid
 import traceback
 import logging
+import threading
+from pathlib import Path
 
 import azure.functions as func
 import httpx
@@ -29,6 +31,25 @@ READ_TIMEOUT_SECONDS = float(os.getenv("PROXY_READ_TIMEOUT_SECONDS", "120"))
 WRITE_TIMEOUT_SECONDS = float(os.getenv("PROXY_WRITE_TIMEOUT_SECONDS", "60"))
 POOL_TIMEOUT_SECONDS = float(os.getenv("PROXY_POOL_TIMEOUT_SECONDS", "20"))
 
+# Async fallback settings
+ASYNC_FALLBACK_ENABLED = os.getenv("PROXY_ASYNC_FALLBACK_ENABLED", "true").lower() == "true"
+ASYNC_FALLBACK_POLL_AFTER_SECONDS = int(os.getenv("PROXY_ASYNC_FALLBACK_POLL_AFTER_SECONDS", "30"))
+ASYNC_JOB_TTL_SECONDS = int(os.getenv("PROXY_ASYNC_JOB_TTL_SECONDS", "86400"))
+ASYNC_JOB_DIR = Path(os.getenv("PROXY_ASYNC_JOB_DIR", "/tmp/azure-openai-proxy-jobs"))
+ASYNC_FALLBACK_STATUS_CODES = {429, 500, 502, 503, 504}
+ASYNC_FALLBACK_ERROR_TYPES = {
+    "ConnectTimeout",
+    "ReadTimeout",
+    "WriteTimeout",
+    "PoolTimeout",
+    "ConnectError",
+    "RequestError",
+    "RetryExhausted",
+}
+
+ASYNC_JOB_DIR.mkdir(parents=True, exist_ok=True)
+_JOB_LOCK = threading.Lock()
+
 
 def _build_timeout() -> httpx.Timeout:
     return httpx.Timeout(
@@ -39,11 +60,13 @@ def _build_timeout() -> httpx.Timeout:
     )
 
 
-def _json_response(body: dict, status_code: int) -> func.HttpResponse:
+def _json_response(body: dict, status_code: int, headers: dict | None = None) -> func.HttpResponse:
+    response_headers = headers or {}
     return func.HttpResponse(
         json.dumps(body, ensure_ascii=False),
         status_code=status_code,
         mimetype="application/json",
+        headers=response_headers,
     )
 
 
@@ -174,6 +197,181 @@ def _proxy_headers(token: str, request_id: str) -> dict:
         "Content-Type": "application/json",
         "x-proxy-request-id": request_id,
     }
+
+
+def _job_file(job_id: str) -> Path:
+    return ASYNC_JOB_DIR / f"{job_id}.json"
+
+
+def _cleanup_expired_jobs() -> None:
+    now = time.time()
+    for path in ASYNC_JOB_DIR.glob("*.json"):
+        try:
+            if now - path.stat().st_mtime > ASYNC_JOB_TTL_SECONDS:
+                path.unlink(missing_ok=True)
+        except Exception:
+            logging.exception("Failed to cleanup async job file: %s", path)
+
+
+def _save_job(job: dict) -> None:
+    with _JOB_LOCK:
+        _cleanup_expired_jobs()
+        _job_file(job["job_id"]).write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_job(job_id: str) -> dict | None:
+    path = _job_file(job_id)
+    if not path.exists():
+        return None
+    with _JOB_LOCK:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _build_job_status_url(job_id: str) -> str:
+    return f"/api/v1/jobs/{job_id}"
+
+
+def _parse_json_bytes(raw: bytes | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _response_text(response: func.HttpResponse) -> str:
+    try:
+        return response.get_body().decode("utf-8")
+    except Exception:
+        return response.get_body().decode("utf-8", errors="replace")
+
+
+def _is_async_fallback_candidate(response: func.HttpResponse, payload: dict) -> bool:
+    if not ASYNC_FALLBACK_ENABLED:
+        return False
+
+    if _should_stream(payload):
+        return False
+
+    if response.status_code not in ASYNC_FALLBACK_STATUS_CODES:
+        return False
+
+    parsed = _parse_json_bytes(response.get_body())
+    if parsed is None:
+        return response.status_code in {502, 503, 504}
+
+    error_type = parsed.get("error_type")
+    backend_status_code = parsed.get("backend_status_code")
+
+    if error_type in ASYNC_FALLBACK_ERROR_TYPES:
+        return True
+
+    if isinstance(backend_status_code, int) and backend_status_code in ASYNC_FALLBACK_STATUS_CODES:
+        return True
+
+    return response.status_code in {502, 503, 504}
+
+
+def _accepted_async_response(*, request_id: str, job_id: str, deployment: str | None, requested_model: str | None) -> func.HttpResponse:
+    body = {
+        "ok": True,
+        "mode": "async_fallback",
+        "proxy_request_id": request_id,
+        "job_id": job_id,
+        "status": "queued",
+        "status_url": _build_job_status_url(job_id),
+        "poll_after_seconds": ASYNC_FALLBACK_POLL_AFTER_SECONDS,
+        "deployment": deployment,
+        "requested_model": requested_model,
+    }
+    return _json_response(
+        body,
+        status_code=202,
+        headers={
+            "x-proxy-request-id": request_id,
+            "x-proxy-mode": "async_fallback",
+            "x-proxy-job-id": job_id,
+            "Retry-After": str(ASYNC_FALLBACK_POLL_AFTER_SECONDS),
+        },
+    )
+
+
+def _run_async_job(job_id: str) -> None:
+    job = _load_job(job_id)
+    if job is None:
+        return
+
+    job["status"] = "running"
+    job["started_at"] = time.time()
+    _save_job(job)
+
+    request_data = job["request"]
+    response = _forward_request(
+        request_id=f"{job_id}:async",
+        payload=request_data["payload"],
+        backend_url=request_data["backend_url"],
+        params=request_data["params"],
+        requested_model=request_data["requested_model"],
+        deployment=request_data["deployment"],
+    )
+
+    response_text = _response_text(response)
+    content_type = response.mimetype or "application/json"
+
+    if 200 <= response.status_code < 300:
+        job["status"] = "succeeded"
+    else:
+        job["status"] = "failed"
+
+    job["finished_at"] = time.time()
+    job["result"] = {
+        "status_code": response.status_code,
+        "content_type": content_type,
+        "body_text": response_text,
+        "headers": {
+            "x-proxy-backend-status": response.headers.get("x-proxy-backend-status", ""),
+            "x-proxy-deployment": response.headers.get("x-proxy-deployment", ""),
+            "x-proxy-retry-attempt": response.headers.get("x-proxy-retry-attempt", ""),
+        },
+    }
+    _save_job(job)
+
+
+def _submit_async_job(
+    *,
+    request_id: str,
+    payload: dict,
+    backend_url: str,
+    params: dict,
+    requested_model: str | None,
+    deployment: str | None,
+) -> func.HttpResponse:
+    job_id = str(uuid.uuid4())
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "created_at": time.time(),
+        "request": {
+            "payload": payload,
+            "backend_url": backend_url,
+            "params": params,
+            "requested_model": requested_model,
+            "deployment": deployment,
+        },
+        "result": None,
+    }
+    _save_job(job)
+
+    worker = threading.Thread(target=_run_async_job, args=(job_id,), daemon=True)
+    worker.start()
+
+    return _accepted_async_response(
+        request_id=request_id,
+        job_id=job_id,
+        deployment=deployment,
+        requested_model=requested_model,
+    )
 
 
 def _stream_backend_response(
@@ -506,6 +704,43 @@ def _forward_request(
     )
 
 
+def _handle_proxy_request(
+    *,
+    request_id: str,
+    payload: dict,
+    backend_url: str,
+    params: dict,
+    requested_model: str | None,
+    deployment: str | None,
+) -> func.HttpResponse:
+    response = _forward_request(
+        request_id=request_id,
+        payload=payload,
+        backend_url=backend_url,
+        params=params,
+        requested_model=requested_model,
+        deployment=deployment,
+    )
+
+    if _is_async_fallback_candidate(response, payload):
+        logging.warning(
+            "Sync request failed and will fallback to async. request_id=%s status=%s deployment=%s",
+            request_id,
+            response.status_code,
+            deployment,
+        )
+        return _submit_async_job(
+            request_id=request_id,
+            payload=payload,
+            backend_url=backend_url,
+            params=params,
+            requested_model=requested_model,
+            deployment=deployment,
+        )
+
+    return response
+
+
 @app.route(route="v1/chat/completions", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def chat_completions(req: func.HttpRequest) -> func.HttpResponse:
     request_id = str(uuid.uuid4())
@@ -540,7 +775,7 @@ def chat_completions(req: func.HttpRequest) -> func.HttpResponse:
     backend_url = f"{BASE}/openai/deployments/{deployment}/chat/completions"
     params = {"api-version": API_VERSION}
 
-    return _forward_request(
+    return _handle_proxy_request(
         request_id=request_id,
         payload=payload,
         backend_url=backend_url,
@@ -583,7 +818,7 @@ def responses(req: func.HttpRequest) -> func.HttpResponse:
     backend_url = f"{BASE}/openai/v1/responses"
     params = {"api-version": V1_API_VERSION}
 
-    return _forward_request(
+    return _handle_proxy_request(
         request_id=request_id,
         payload=payload,
         backend_url=backend_url,
@@ -591,3 +826,67 @@ def responses(req: func.HttpRequest) -> func.HttpResponse:
         requested_model=requested_model,
         deployment=deployment,
     )
+
+
+@app.route(route="v1/jobs/{job_id}", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def get_job(req: func.HttpRequest) -> func.HttpResponse:
+    request_id = str(uuid.uuid4())
+    job_id = req.route_params.get("job_id")
+
+    if not job_id:
+        return _error_response(
+            request_id=request_id,
+            error_type="MissingJobId",
+            message="job_id is required.",
+            status_code=400,
+            stage="job_lookup",
+        )
+
+    job = _load_job(job_id)
+    if job is None:
+        return _error_response(
+            request_id=request_id,
+            error_type="JobNotFound",
+            message=f"Async job '{job_id}' was not found.",
+            status_code=404,
+            stage="job_lookup",
+        )
+
+    body = {
+        "ok": True,
+        "job_id": job_id,
+        "status": job["status"],
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "status_url": _build_job_status_url(job_id),
+        "poll_after_seconds": ASYNC_FALLBACK_POLL_AFTER_SECONDS,
+    }
+
+    if job["status"] in {"queued", "running"}:
+        return _json_response(
+            body,
+            status_code=200,
+            headers={
+                "x-proxy-request-id": request_id,
+                "Retry-After": str(ASYNC_FALLBACK_POLL_AFTER_SECONDS),
+            },
+        )
+
+    result = job.get("result") or {}
+    result_body_text = result.get("body_text")
+    result_body_json = None
+    if isinstance(result_body_text, str):
+        try:
+            result_body_json = json.loads(result_body_text)
+        except Exception:
+            result_body_json = None
+
+    body["result"] = {
+        "status_code": result.get("status_code"),
+        "content_type": result.get("content_type"),
+        "headers": result.get("headers", {}),
+        "body_json": result_body_json,
+        "body_text": None if result_body_json is not None else result_body_text,
+    }
+    return _json_response(body, status_code=200, headers={"x-proxy-request-id": request_id})
