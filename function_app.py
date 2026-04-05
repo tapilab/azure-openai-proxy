@@ -22,7 +22,7 @@ DEFAULT_MODEL_ALIAS = os.getenv("AZURE_OPENAI_DEFAULT_MODEL_ALIAS")
 
 SCOPE = "https://cognitiveservices.azure.com/.default"
 
-# Retry and timeout settings
+# Retry and timeout settings (sync path)
 MAX_RETRIES = int(os.getenv("PROXY_MAX_RETRIES", "2"))
 RETRY_BACKOFF_SECONDS = float(os.getenv("PROXY_RETRY_BACKOFF_SECONDS", "1.5"))
 
@@ -31,11 +31,38 @@ READ_TIMEOUT_SECONDS = float(os.getenv("PROXY_READ_TIMEOUT_SECONDS", "120"))
 WRITE_TIMEOUT_SECONDS = float(os.getenv("PROXY_WRITE_TIMEOUT_SECONDS", "60"))
 POOL_TIMEOUT_SECONDS = float(os.getenv("PROXY_POOL_TIMEOUT_SECONDS", "20"))
 
+# Keep the synchronous path under Azure's HTTP front-end timeout so the proxy can
+# still return a controlled error/202 fallback instead of being cut off by the platform.
+SYNC_HARD_DEADLINE_SECONDS = float(os.getenv("PROXY_SYNC_HARD_DEADLINE_SECONDS", "210"))
+
+# Timeout settings for async background execution.
+ASYNC_CONNECT_TIMEOUT_SECONDS = float(os.getenv("PROXY_ASYNC_CONNECT_TIMEOUT_SECONDS", str(CONNECT_TIMEOUT_SECONDS)))
+ASYNC_READ_TIMEOUT_SECONDS = float(os.getenv("PROXY_ASYNC_READ_TIMEOUT_SECONDS", "600"))
+ASYNC_WRITE_TIMEOUT_SECONDS = float(os.getenv("PROXY_ASYNC_WRITE_TIMEOUT_SECONDS", str(WRITE_TIMEOUT_SECONDS)))
+ASYNC_POOL_TIMEOUT_SECONDS = float(os.getenv("PROXY_ASYNC_POOL_TIMEOUT_SECONDS", str(POOL_TIMEOUT_SECONDS)))
+
+# Instance identity helps debug cross-instance JobNotFound issues.
+PROXY_INSTANCE_ID = os.getenv("WEBSITE_INSTANCE_ID") or os.getenv("HOSTNAME") or ""
+
+
+def _choose_async_job_dir() -> Path:
+    """Prefer an app-persisted location over /tmp for async job files."""
+    env_dir = os.getenv("PROXY_ASYNC_JOB_DIR")
+    if env_dir:
+        return Path(env_dir)
+
+    home = os.getenv("HOME")
+    if home:
+        return Path(home) / "data" / "azure-openai-proxy-jobs"
+
+    return Path("/tmp/azure-openai-proxy-jobs")
+
+
 # Async fallback settings
 ASYNC_FALLBACK_ENABLED = os.getenv("PROXY_ASYNC_FALLBACK_ENABLED", "true").lower() == "true"
 ASYNC_FALLBACK_POLL_AFTER_SECONDS = int(os.getenv("PROXY_ASYNC_FALLBACK_POLL_AFTER_SECONDS", "30"))
 ASYNC_JOB_TTL_SECONDS = int(os.getenv("PROXY_ASYNC_JOB_TTL_SECONDS", "86400"))
-ASYNC_JOB_DIR = Path(os.getenv("PROXY_ASYNC_JOB_DIR", "/tmp/azure-openai-proxy-jobs"))
+ASYNC_JOB_DIR = _choose_async_job_dir()
 ASYNC_FALLBACK_STATUS_CODES = {429, 500, 502, 503, 504}
 ASYNC_FALLBACK_ERROR_TYPES = {
     "ConnectTimeout",
@@ -45,18 +72,40 @@ ASYNC_FALLBACK_ERROR_TYPES = {
     "ConnectError",
     "RequestError",
     "RetryExhausted",
+    "SyncBudgetExceeded",
 }
 
 ASYNC_JOB_DIR.mkdir(parents=True, exist_ok=True)
 _JOB_LOCK = threading.Lock()
 
 
-def _build_timeout() -> httpx.Timeout:
+def _build_timeout(*, for_async: bool = False, remaining_budget_seconds: float | None = None) -> httpx.Timeout:
+    if for_async:
+        return httpx.Timeout(
+            connect=ASYNC_CONNECT_TIMEOUT_SECONDS,
+            read=ASYNC_READ_TIMEOUT_SECONDS,
+            write=ASYNC_WRITE_TIMEOUT_SECONDS,
+            pool=ASYNC_POOL_TIMEOUT_SECONDS,
+        )
+
+    connect_timeout = CONNECT_TIMEOUT_SECONDS
+    read_timeout = READ_TIMEOUT_SECONDS
+    write_timeout = WRITE_TIMEOUT_SECONDS
+    pool_timeout = POOL_TIMEOUT_SECONDS
+
+    if remaining_budget_seconds is not None:
+        safety_margin = 3.0
+        usable_budget = max(remaining_budget_seconds - safety_margin, 1.0)
+        connect_timeout = min(connect_timeout, usable_budget)
+        read_timeout = min(read_timeout, usable_budget)
+        write_timeout = min(write_timeout, usable_budget)
+        pool_timeout = min(pool_timeout, usable_budget)
+
     return httpx.Timeout(
-        connect=CONNECT_TIMEOUT_SECONDS,
-        read=READ_TIMEOUT_SECONDS,
-        write=WRITE_TIMEOUT_SECONDS,
-        pool=POOL_TIMEOUT_SECONDS,
+        connect=connect_timeout,
+        read=read_timeout,
+        write=write_timeout,
+        pool=pool_timeout,
     )
 
 
@@ -216,7 +265,10 @@ def _cleanup_expired_jobs() -> None:
 def _save_job(job: dict) -> None:
     with _JOB_LOCK:
         _cleanup_expired_jobs()
-        _job_file(job["job_id"]).write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+        path = _job_file(job["job_id"])
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(path)
 
 
 def _load_job(job_id: str) -> dict | None:
@@ -224,7 +276,11 @@ def _load_job(job_id: str) -> dict | None:
     if not path.exists():
         return None
     with _JOB_LOCK:
-        return json.loads(path.read_text(encoding="utf-8"))
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logging.exception("Failed to parse async job file: %s", path)
+            return None
 
 
 def _build_job_status_url(job_id: str) -> str:
@@ -259,7 +315,7 @@ def _is_async_fallback_candidate(response: func.HttpResponse, payload: dict) -> 
 
     parsed = _parse_json_bytes(response.get_body())
     if parsed is None:
-        return response.status_code in {502, 503, 504}
+        return response.status_code in {500, 502, 503, 504}
 
     error_type = parsed.get("error_type")
     backend_status_code = parsed.get("backend_status_code")
@@ -270,7 +326,7 @@ def _is_async_fallback_candidate(response: func.HttpResponse, payload: dict) -> 
     if isinstance(backend_status_code, int) and backend_status_code in ASYNC_FALLBACK_STATUS_CODES:
         return True
 
-    return response.status_code in {502, 503, 504}
+    return response.status_code in {500, 502, 503, 504}
 
 
 def _accepted_async_response(*, request_id: str, job_id: str, deployment: str | None, requested_model: str | None) -> func.HttpResponse:
@@ -284,6 +340,7 @@ def _accepted_async_response(*, request_id: str, job_id: str, deployment: str | 
         "poll_after_seconds": ASYNC_FALLBACK_POLL_AFTER_SECONDS,
         "deployment": deployment,
         "requested_model": requested_model,
+        "proxy_instance_id": PROXY_INSTANCE_ID,
     }
     return _json_response(
         body,
@@ -292,6 +349,7 @@ def _accepted_async_response(*, request_id: str, job_id: str, deployment: str | 
             "x-proxy-request-id": request_id,
             "x-proxy-mode": "async_fallback",
             "x-proxy-job-id": job_id,
+            "x-proxy-instance-id": PROXY_INSTANCE_ID,
             "Retry-After": str(ASYNC_FALLBACK_POLL_AFTER_SECONDS),
         },
     )
@@ -314,6 +372,7 @@ def _run_async_job(job_id: str) -> None:
         params=request_data["params"],
         requested_model=request_data["requested_model"],
         deployment=request_data["deployment"],
+        for_async=True,
     )
 
     response_text = _response_text(response)
@@ -352,6 +411,7 @@ def _submit_async_job(
         "job_id": job_id,
         "status": "queued",
         "created_at": time.time(),
+        "proxy_instance_id": PROXY_INSTANCE_ID,
         "request": {
             "payload": payload,
             "backend_url": backend_url,
@@ -502,6 +562,7 @@ def _forward_request(
     params: dict,
     requested_model: str | None,
     deployment: str | None,
+    for_async: bool = False,
 ) -> func.HttpResponse:
     try:
         token = _get_token(request_id)
@@ -532,10 +593,29 @@ def _forward_request(
         )
 
     last_exception = None
+    started_at = time.time()
 
     for attempt in range(MAX_RETRIES + 1):
         try:
-            with httpx.Client(timeout=_build_timeout()) as client:
+            remaining_budget_seconds = None
+            if not for_async:
+                elapsed = time.time() - started_at
+                remaining_budget_seconds = SYNC_HARD_DEADLINE_SECONDS - elapsed
+                if remaining_budget_seconds <= 1.0:
+                    return _error_response(
+                        request_id=request_id,
+                        error_type="SyncBudgetExceeded",
+                        message="Synchronous proxy budget was exhausted before Azure could cut off the HTTP request. Falling back is allowed.",
+                        status_code=504,
+                        stage="proxy_to_backend",
+                        requested_model=requested_model,
+                        deployment=deployment,
+                        backend_url=backend_url,
+                        retry_attempt=attempt,
+                        max_retries=MAX_RETRIES,
+                    )
+
+            with httpx.Client(timeout=_build_timeout(for_async=for_async, remaining_budget_seconds=remaining_budget_seconds)) as client:
                 r = client.post(
                     backend_url,
                     params=params,
@@ -544,7 +624,23 @@ def _forward_request(
                 )
 
             if _should_retry_response(r) and attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                sleep_seconds = RETRY_BACKOFF_SECONDS * (attempt + 1)
+                if not for_async:
+                    elapsed = time.time() - started_at
+                    remaining_budget_seconds = SYNC_HARD_DEADLINE_SECONDS - elapsed
+                    if remaining_budget_seconds <= sleep_seconds + 1.0:
+                        return func.HttpResponse(
+                            r.content,
+                            status_code=r.status_code,
+                            mimetype=r.headers.get("content-type", "application/json"),
+                            headers={
+                                "x-proxy-request-id": request_id,
+                                "x-proxy-backend-status": str(r.status_code),
+                                "x-proxy-deployment": deployment or "",
+                                "x-proxy-retry-attempt": str(attempt),
+                            },
+                        )
+                time.sleep(sleep_seconds)
                 continue
 
             return func.HttpResponse(
@@ -562,7 +658,25 @@ def _forward_request(
         except httpx.ConnectTimeout as e:
             last_exception = e
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                sleep_seconds = RETRY_BACKOFF_SECONDS * (attempt + 1)
+                if not for_async:
+                    elapsed = time.time() - started_at
+                    remaining_budget_seconds = SYNC_HARD_DEADLINE_SECONDS - elapsed
+                    if remaining_budget_seconds <= sleep_seconds + 1.0:
+                        return _error_response(
+                            request_id=request_id,
+                            error_type="ConnectTimeout",
+                            message="Timed out while connecting to Azure backend before sync budget expired.",
+                            status_code=504,
+                            stage="proxy_to_backend",
+                            requested_model=requested_model,
+                            deployment=deployment,
+                            backend_url=backend_url,
+                            retry_attempt=attempt,
+                            max_retries=MAX_RETRIES,
+                            exception=e,
+                        )
+                time.sleep(sleep_seconds)
                 continue
             return _error_response(
                 request_id=request_id,
@@ -581,7 +695,25 @@ def _forward_request(
         except httpx.ReadTimeout as e:
             last_exception = e
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                sleep_seconds = RETRY_BACKOFF_SECONDS * (attempt + 1)
+                if not for_async:
+                    elapsed = time.time() - started_at
+                    remaining_budget_seconds = SYNC_HARD_DEADLINE_SECONDS - elapsed
+                    if remaining_budget_seconds <= sleep_seconds + 1.0:
+                        return _error_response(
+                            request_id=request_id,
+                            error_type="ReadTimeout",
+                            message="Timed out while waiting for Azure backend before sync budget expired.",
+                            status_code=504,
+                            stage="proxy_to_backend",
+                            requested_model=requested_model,
+                            deployment=deployment,
+                            backend_url=backend_url,
+                            retry_attempt=attempt,
+                            max_retries=MAX_RETRIES,
+                            exception=e,
+                        )
+                time.sleep(sleep_seconds)
                 continue
             return _error_response(
                 request_id=request_id,
@@ -600,7 +732,25 @@ def _forward_request(
         except httpx.WriteTimeout as e:
             last_exception = e
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                sleep_seconds = RETRY_BACKOFF_SECONDS * (attempt + 1)
+                if not for_async:
+                    elapsed = time.time() - started_at
+                    remaining_budget_seconds = SYNC_HARD_DEADLINE_SECONDS - elapsed
+                    if remaining_budget_seconds <= sleep_seconds + 1.0:
+                        return _error_response(
+                            request_id=request_id,
+                            error_type="WriteTimeout",
+                            message="Timed out while sending request to Azure backend before sync budget expired.",
+                            status_code=504,
+                            stage="proxy_to_backend",
+                            requested_model=requested_model,
+                            deployment=deployment,
+                            backend_url=backend_url,
+                            retry_attempt=attempt,
+                            max_retries=MAX_RETRIES,
+                            exception=e,
+                        )
+                time.sleep(sleep_seconds)
                 continue
             return _error_response(
                 request_id=request_id,
@@ -619,7 +769,25 @@ def _forward_request(
         except httpx.PoolTimeout as e:
             last_exception = e
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                sleep_seconds = RETRY_BACKOFF_SECONDS * (attempt + 1)
+                if not for_async:
+                    elapsed = time.time() - started_at
+                    remaining_budget_seconds = SYNC_HARD_DEADLINE_SECONDS - elapsed
+                    if remaining_budget_seconds <= sleep_seconds + 1.0:
+                        return _error_response(
+                            request_id=request_id,
+                            error_type="PoolTimeout",
+                            message="Timed out while waiting for pooled connection before sync budget expired.",
+                            status_code=503,
+                            stage="proxy_to_backend",
+                            requested_model=requested_model,
+                            deployment=deployment,
+                            backend_url=backend_url,
+                            retry_attempt=attempt,
+                            max_retries=MAX_RETRIES,
+                            exception=e,
+                        )
+                time.sleep(sleep_seconds)
                 continue
             return _error_response(
                 request_id=request_id,
@@ -638,7 +806,25 @@ def _forward_request(
         except httpx.ConnectError as e:
             last_exception = e
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                sleep_seconds = RETRY_BACKOFF_SECONDS * (attempt + 1)
+                if not for_async:
+                    elapsed = time.time() - started_at
+                    remaining_budget_seconds = SYNC_HARD_DEADLINE_SECONDS - elapsed
+                    if remaining_budget_seconds <= sleep_seconds + 1.0:
+                        return _error_response(
+                            request_id=request_id,
+                            error_type="ConnectError",
+                            message="Failed to connect to Azure backend before sync budget expired.",
+                            status_code=502,
+                            stage="proxy_to_backend",
+                            requested_model=requested_model,
+                            deployment=deployment,
+                            backend_url=backend_url,
+                            retry_attempt=attempt,
+                            max_retries=MAX_RETRIES,
+                            exception=e,
+                        )
+                time.sleep(sleep_seconds)
                 continue
             return _error_response(
                 request_id=request_id,
@@ -657,7 +843,25 @@ def _forward_request(
         except httpx.RequestError as e:
             last_exception = e
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                sleep_seconds = RETRY_BACKOFF_SECONDS * (attempt + 1)
+                if not for_async:
+                    elapsed = time.time() - started_at
+                    remaining_budget_seconds = SYNC_HARD_DEADLINE_SECONDS - elapsed
+                    if remaining_budget_seconds <= sleep_seconds + 1.0:
+                        return _error_response(
+                            request_id=request_id,
+                            error_type="RequestError",
+                            message="HTTPX request error before sync budget expired.",
+                            status_code=502,
+                            stage="proxy_to_backend",
+                            requested_model=requested_model,
+                            deployment=deployment,
+                            backend_url=backend_url,
+                            retry_attempt=attempt,
+                            max_retries=MAX_RETRIES,
+                            exception=e,
+                        )
+                time.sleep(sleep_seconds)
                 continue
             return _error_response(
                 request_id=request_id,
